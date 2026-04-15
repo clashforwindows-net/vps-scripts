@@ -5,8 +5,8 @@
 ## 脚本列表
 
 ### 系统管理
-- Docker 容器管理工具
-- MySQL 数据库自动备份脚本
+- **docker-manager.sh** - Docker 容器管理工具 (start/stop/restart/status/logs/clean)
+- **mysql-backup.sh** - MySQL 数据库自动备份脚本 (支持云端同步)
 
 ### VPN 工具
 - 一键 WireGuard 安装
@@ -27,9 +27,9 @@ bash scripts/docker-manager.sh status
 
 ## 相关项目
 
-- vps-tools - VPS 工具集
-- server-monitoring - 服务器监控
+- [vps-tools](https://github.com/clashforwindows-net/vps-tools) - VPS 工具集
+- [server-monitoring](https://github.com/clashforwindows-net/server-monitoring) - 服务器监控
 
 ---
-最后更新: 2026-04-10
-赞助商: vpsvip.net
+最后更新: 2026-04-15
+赞助商: [vpsvip.net](https://vpsvip.net)
