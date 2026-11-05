@@ -28,6 +28,7 @@
 - [十五、脚本运行环境推荐](#十五脚本运行环境推荐)
 - [十六、FAQ](#十六faq)
 - [十七、相关项目与资源](#十七相关项目与资源)
+- [附录 A · 脚本里的凭据管理](#附录-a--脚本里的凭据管理从明文密码到短时令牌)
 
 ---
 
@@ -921,6 +922,266 @@ sudo ./scripts/init/system-init.sh --hostname "$(hostname)" -y
 
 ---
 
+## 附录 A · 脚本里的凭据管理：从明文密码到短时令牌
+
+> 脚本库最容易出事的地方，不是 `rm -rf` 少了变量保护，而是**凭据在脚本这条链路上被反复搬运**：写进 `.env`、传进命令行、打进日志、提交到 git、同步进备份。
+> 本附录把"凭据在脚本中如何安全活着"讲成一条完整生命周期：生成 → 分发 → 使用 → 轮换 → 吊销。
+
+### A.1 五种凭据载体，五种泄漏方式
+
+| 载体 | 典型写法 | 泄漏面 | 风险 |
+|------|----------|--------|------|
+| 硬编码 | `MYSQL_PWD="xxx"` | git 历史、代码分享、备份 | 极高，且难以彻底清除 |
+| 命令行参数 | `mysql -p"$PASS"` | `/proc/*/cmdline` 对所有用户可读 | 高 |
+| 环境变量 | `export TOKEN=...` | `/proc/PID/environ`、`systemctl show-environment`、core dump | 中高 |
+| 凭据文件 | `conf/vps-scripts.env` | 权限过宽、随仓库提交、备份外泄 | 中（可控） |
+| 凭据服务 | Vault / systemd credentials / 云 STS | 依赖正确配置与 TTL | 低（推荐） |
+
+先记住一个反直觉的结论：**在 Linux 上"命令行参数"比"环境变量"更不安全。** `/proc/PID/cmdline` 的默认权限是 0444，同机任何用户 `ps aux` 就能看到；而 `/proc/PID/environ` 是 0400 且仅对属主/root 可读。所以 `mysql -p"$PASS"` 这类写法，会把密码广播给整台机器。
+
+### A.2 反模式与正模式
+
+```bash
+# ❌ 反模式 1：密码进命令行
+mysql -u root -p"$DB_PASS" -e "SHOW DATABASES"
+
+# ✅ 正模式 1a：用配置文件（0600），命令行只给路径
+mysql --defaults-extra-file=/run/secrets/mysql.cnf -e "SHOW DATABASES"
+
+# ✅ 正模式 1b：用 login-path，密码由 mysql_config_editor 加密存于 ~/.mylogin.cnf
+mysql_config_editor set --login-path=backup --host=127.0.0.1 --user=backup --password
+mysql --login-path=backup -e "SHOW DATABASES"
+```
+
+```bash
+# ❌ 反模式 2：curl 把 token 写进 URL（会进 access log、Referer、shell history）
+curl "https://api.example.com/v1/x?token=$TOKEN"
+
+# ✅ 正模式 2：走 header，且用 --config 从文件读，避免出现在 ps 里
+cat > /run/secrets/curl.cfg <<EOF
+header = "Authorization: Bearer $(cat /run/secrets/api.token)"
+EOF
+chmod 600 /run/secrets/curl.cfg
+curl --config /run/secrets/curl.cfg https://api.example.com/v1/x
+```
+
+```bash
+# ❌ 反模式 3：set -x 之后所有变量裸奔，包括刚解密的密码
+set -x
+
+# ✅ 正模式 3：不全局开 trace，只在需要的函数内开，并对已知敏感变量做掩码
+redact() { sed -E 's/(PASS|TOKEN|SECRET|KEY)[A-Z_]*=[^ ]*/\1***=***/g'; }
+run_verbose() { set -x; "$@" 2>&1 | redact; set +x; }
+```
+
+### A.3 文件凭据的正确做法
+
+三层约束缺一不可：**位置、权限、生命周期**。
+
+```bash
+install -d -m 0700 -o root -g root /etc/vps-scripts
+install -m 0600 -o root -g root /dev/null /etc/vps-scripts/secrets.env
+
+# 目录 0700 + 文件 0600，且属主固定 root：脚本用 root 跑才读得到
+stat -c '%a %U:%G %n' /etc/vps-scripts /etc/vps-scripts/secrets.env
+```
+
+更严格的场景把凭据放 **tmpfs**，避免落盘后被快照、被备份、被磁盘取证：
+
+```bash
+install -d -m 0700 /run/secrets
+mount -t tmpfs -o size=1m,mode=0700 tmpfs /run/secrets
+```
+
+脚本加载时做一次"体检"，把错误配置挡在启动阶段：
+
+```bash
+load_secrets() {
+  local f="${1:-/etc/vps-scripts/secrets.env}"
+  [[ -r "$f" ]] || die 4 "secrets file not readable: $f"
+  local mode; mode=$(stat -c '%a' "$f")
+  (( 8#$mode & 8#077 )) && die 4 "secrets file is too permissive ($mode), chmod 600 it"
+  # shellcheck disable=SC1090
+  set -a; source "$f"; set +a
+}
+```
+
+### A.4 systemd credentials：把凭据从"文件"变成"运行时对象"
+
+systemd 的 `LoadCredential` 机制解决了一个长期痛点：**凭据只在服务进程的私有命名空间里存在，不出现在环境变量、不出现在磁盘上的固定路径、也不会被子进程继承滥用。**
+
+```ini
+# /etc/systemd/system/mysql-backup.service
+[Service]
+Type=oneshot
+# 从磁盘读，挂到 $CREDENTIALS_DIRECTORY/mysql.cnf
+LoadCredential=mysql.cnf:/etc/vps-scripts/mysql.cnf
+# 或者读加密文件（明文永不落盘）
+# LoadCredentialEncrypted=mysql.cnf:/etc/credstore.encrypted/mysql.cnf
+ExecStart=/opt/vps-scripts/scripts/backup/mysql-backup.sh
+```
+
+```bash
+# 脚本内怎么用：注意不是固定路径，而是环境变量指向的目录
+CRED="${CREDENTIALS_DIRECTORY:?must run under systemd with LoadCredential}"
+mysql --defaults-extra-file="$CRED/mysql.cnf" ...
+```
+
+加密凭据的生成（密钥绑定到本机 TPM 或 host key，拷到别的机器就解不开）：
+
+```bash
+systemd-creds encrypt --name=mysql.cnf /etc/vps-scripts/mysql.cnf /etc/credstore.encrypted/mysql.cnf
+systemd-creds cat mysql.cnf | head -3     # 本机可解，用于调试
+```
+
+这条路线的好处很实际：**备份整个 `/etc` 也不会带走可用的明文凭据。**
+
+### A.5 仓库里只放加密凭据：age / sops
+
+脚本库需要版本化配置，但配置里有凭据。做法是"密文入库，解密在运行时"：
+
+```bash
+# age：单文件、无状态、密钥可离线保管
+age-keygen -o ~/.config/age/keys.txt
+age -r age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p \
+    -o conf/prod.env.age conf/prod.env
+
+# 脚本里解密到内存（不进磁盘），用完即弃
+decrypt_to_fd() {
+  age -d -i "$HOME/.config/age/keys.txt" "$1" | \
+    mysql --defaults-extra-file=/dev/stdin ...
+}
+```
+
+```bash
+# sops：适合 YAML/JSON/INI，且支持按字段加密、按云 KMS 分权
+sops --encrypt --age age1ql3z... conf/prod.env > conf/prod.enc.env
+sops exec-env conf/prod.enc.env './scripts/deploy/nginx-deploy.sh --env prod'
+```
+
+用 sops 时有一条硬规则：**解密后的明文只能存在于进程内存或 tmpfs，绝不能 `sops -d > file`。** 后者等于把明文又写回磁盘，前面的努力全部作废。
+
+### A.6 短时令牌：让"泄漏"变成"过期"
+
+长期 AK/密码的最大问题是**窗口无限长**。能换成短时凭证的地方都应换掉：
+
+| 场景 | 长期凭据 | 短时替代 | TTL 建议 |
+|------|----------|----------|----------|
+| 云 API 调用 | AccessKey/SecretKey | STS AssumeRole / 实例角色 | 15–60 分钟 |
+| CI 拉代码/推镜像 | 长期 token | OIDC 联邦换取临时 token | 单次作业 |
+| 数据库备份 | 固定账号密码 | Vault dynamic credentials | 1 小时，自动回收 |
+| SSH 运维 | 长期密钥对 | SSH CA 签发证书 | 8 小时 |
+| 调用内部 API | 静态 Bearer | mTLS 短期证书 / JWT | 5–15 分钟 |
+
+Vault 的动态数据库凭据示意（脚本里不出现任何密码）：
+
+```bash
+CRED_JSON=$(vault read -format=json database/creds/backup-role)
+export DB_USER=$(jq -r '.data.username' <<<"$CRED_JSON")
+export DB_PASS=$(jq -r '.data.password' <<<"$CRED_JSON")
+# TTL 到期后 Vault 会自动 DROP 这个用户，脚本无需做任何清理
+```
+
+### A.7 日志与告警里的脱敏
+
+凭据泄漏最常见的路径不是被黑，而是**自己被日志卖了**。日志系统通常会被转发、被第三方托管、被长期保存，一旦进去就收不回来。
+
+```bash
+# 统一出口：所有日志走一个函数，敏感值在写之前替换
+log() {
+  local level="$1"; shift
+  local msg; msg=$(printf '%s' "$*" | sed -E \
+    -e 's/(password|passwd|pwd|token|secret|apikey|api_key)=([^ &]+)/\1=***/Ig' \
+    -e 's#(https?://)[^/@:]+:[^/@]+@#\1***:***@#g' \
+    -e 's/(Bearer )[A-Za-z0-9._-]+/\1***/g')
+  printf '%s [%s] %s\n' "$(date -u +%FT%TZ)" "$level" "$msg" >&2
+}
+```
+
+两条补充规则：
+
+1. 对外返回的 `curl -v` 输出、`git remote -v` 输出同样要过滤（URL 里可能带 token）。
+2. systemd 服务加 `LogExtraFields` 做结构化标记，但**不要在 `Environment=` 里放密钥**——`systemctl show` 会把它打印出来。
+
+### A.8 已经泄漏了怎么办：顺序很重要
+
+```
+第 1 步  轮换（Rotate）——先让旧凭据失效
+第 2 步  排查使用记录——谁在什么时间用过它
+第 3 步  清理载体——git 历史、日志、备份、聊天记录
+第 4 步  补上导致泄漏的那道口子
+```
+
+**顺序颠倒是最常见的错误**：先花两小时重写 git 历史，而 token 仍然有效，这期间攻击者可以继续使用。
+
+git 历史的清理（只在轮换完成后做）：
+
+```bash
+# 推荐 git filter-repo；BFG 亦可
+git filter-repo --path conf/prod.env --invert-paths
+# 清理后必须通知所有协作者重新克隆，旧的 reflog/镜像仍可能留存
+```
+
+日常防线：提交前扫描。
+
+```bash
+# gitleaks 作为 pre-commit 钩子
+gitleaks protect --staged --verbose
+# trufflehog 扫历史（含熵检测）
+trufflehog git file://. --only-verified
+```
+
+### A.9 凭据生命周期自动化（脚本模板）
+
+```bash
+#!/usr/bin/env bash
+# cred-rotate.sh —— 生成 → 分发 → 验证 → 吊销，四段式
+set -Eeuo pipefail
+
+creds_generate() { openssl rand -base64 48; }
+
+creds_distribute() {   # 只写到 tmpfs + systemd 加密存储，双写保证可回滚
+  printf '%s' "$1" | install -m 0600 /dev/stdin /run/secrets/app.token
+  printf '%s' "$1" | systemd-creds encrypt --name=app.token - /etc/credstore.encrypted/app.token
+}
+
+creds_verify() {       # 新旧并存期用新凭据做一次真实调用
+  curl -fsS -H "Authorization: Bearer $(cat /run/secrets/app.token)" \
+       https://api.example.com/v1/ping >/dev/null
+}
+
+creds_revoke() {       # 验证通过后再吊销旧凭据，并把吊销时间记入审计
+  curl -fsS -X DELETE -H "Authorization: Bearer $OLD_TOKEN" \
+       https://api.example.com/v1/tokens/current >/dev/null
+  logger -t cred-rotate "revoked old token, new token active"
+}
+
+main() {
+  local new; new=$(creds_generate)
+  creds_distribute "$new"
+  creds_verify || { echo "new credential failed verification, rolled back" >&2; exit 1; }
+  creds_revoke
+}
+main "$@"
+```
+
+这个模板的关键在 **`creds_verify` 必须在 `creds_revoke` 之前**：先证明新的能用，再销毁旧的。少了这一步，轮换本身就变成一次故障。
+
+### A.10 上线前自查清单
+
+- [ ] 仓库里 `git grep -nE '(password|token|secret|apikey)\s*='` 无明文命中
+- [ ] 所有 `mysql`/`redis-cli`/`curl` 调用都不带 `-p`/`?token=`/`-u user:pass`
+- [ ] 凭据文件权限为 `0600`，属主 root，配置目录 `0700`
+- [ ] 脚本有 `--dry-run`，能在不接触真实凭据的情况下跑通流程
+- [ ] 日志函数统一出口，敏感字段做掩码；`set -x` 不常开
+- [ ] 每个凭据都有明确 TTL 与轮换责任人
+- [ ] 轮换脚本经过一次真实演练（含失败回滚）
+- [ ] pre-commit 已接入 gitleaks，CI 里跑 trufflehog
+
+凭据管理做到这一步，脚本库才算"可以被别人用"——因为你交付的不只是能跑的命令，而是一套**即使被看见也不会出事**的工程习惯。
+
+---
+
 ## 免责声明
 
 本仓库脚本会修改系统配置。请务必：
@@ -936,10 +1197,13 @@ sudo ./scripts/init/system-init.sh --hostname "$(hostname)" -y
 
 - 💡 **VPS 评测与选购**：[vpsvip.net](https://vpsvip.net)
 - 🌐 **网络工具导航**：[nav.clashvip.net](https://nav.clashvip.net)
+- 🧩 **Clash 资源与订阅**：[clashhub.net](https://clashhub.net)
+- 💬 **Clash 技术论坛**：[bbs.clashhub.net](https://bbs.clashhub.net)
+- 🪟 **Clash for Windows 中文站**：[clash-for-windows.net](https://clash-for-windows.net)
 - ⭐ 觉得有用请点个 Star，这是持续维护的最大动力
 
 **License**: MIT
 
 ---
 
-*最后更新: 2026-08-10 | 维护者: clashforwindows-net | 赞助商: [vpsvip.net](https://vpsvip.net)*
+*最后更新: 2026-11-05 | 维护者: clashforwindows-net | 赞助商: [vpsvip.net](https://vpsvip.net)*
